@@ -34,7 +34,6 @@ def fetch(url):
 def get_article_links(category_url=CATEGORY_URL, limit=50):
     """
     카테고리 페이지에서 기사 링크를 최대 limit개까지 수집.
-    TechCrunch는 동적 로딩이 있으나 1페이지의 주요 기사 링크는 서버 렌더링됨.
     """
     html = fetch(category_url).text
     soup = BeautifulSoup(html, "html.parser")
@@ -74,14 +73,14 @@ def normalize_link(href: str) -> str:
 def parse_article(url: str):
     """
     기사 페이지에서 제목, 본문, 발행일시(UTC/KST 변환)를 파싱.
-    발행일은 우선순위:
+    발행일 우선순위:
       1) <meta property="article:published_time" content="ISO8601">
       2) JSON-LD(NewsArticle/BlogPosting) 내 datePublished
       3) <time datetime="...">
-      4) 본문 상단 날짜 텍스트(최후 수단, 정규식)
-    본문은 다음 우선순위:
+      4) 페이지 텍스트의 월/일/연도 패턴
+    본문 우선순위:
       1) JSON-LD의 articleBody
-      2) 본문 컨테이너 내 <p>들을 연결
+      2) <article> 내 <p>들 연결
     """
     res = fetch(url)
     soup = BeautifulSoup(res.text, "html.parser")
@@ -99,17 +98,14 @@ def parse_article(url: str):
     )
 
     # 본문
-    body_text = (
-        get_ldjson_article_body(soup)
-        or extract_paragraphs(soup)
-    )
+    body_text = get_ldjson_article_body(soup) or extract_paragraphs(soup)
 
     return {
         "url": url,
         "title": title_text,
         "published_utc": published_dt.astimezone(timezone.utc).isoformat() if published_dt else None,
         "published_kst": published_dt.astimezone(KST).isoformat() if published_dt else None,
-        "body": body_text.strip()
+        "body": (body_text or "").strip()
     }
 
 def get_meta_datetime(soup, prop):
@@ -142,24 +138,20 @@ def get_time_tag_datetime(soup):
             return datetime.fromisoformat(t["datetime"].replace("Z", "+00:00"))
         except Exception:
             pass
-    # 화면표시 텍스트에 '· Month DD, YYYY' 형태가 있을 수 있음
     if t and t.get_text(strip=True):
         return parse_human_datetime(t.get_text(" ", strip=True))
     return None
 
 def get_text_datetime_fallback(soup):
-    # 기사 상단 영역에 '10:10 PM PDT · September 10, 2025' 같은 문자열이 있을 수 있음
     text = soup.get_text(" ", strip=True)
     return parse_human_datetime(text)
 
 def parse_human_datetime(text: str):
-    # 예: "September 10, 2025" / "10:10 PM PDT · September 10, 2025"
     m = re.search(r"(January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2},\s+\d{4}", text)
     if m:
         try:
             d = datetime.strptime(m.group(0), "%B %d, %Y")
-            # 시각 정보가 없으면 UTC 자정으로 가정
-            return d.replace(tzinfo=timezone.utc)
+            return d.replace(tzinfo=timezone.utc)  # 시각 없으면 UTC 자정
         except Exception:
             return None
     return None
@@ -179,11 +171,9 @@ def get_ldjson_article_body(soup):
     return None
 
 def extract_paragraphs(soup):
-    # 기사 본문 컨테이너 추정: <article> 내부 p 수집(aside/figure/nav 등 제외)
     article = soup.find("article") or soup
     paragraphs = []
     for p in article.find_all("p"):
-        # 광고/공유/캡션/네비 등 제외 가능성 높은 패턴 제거
         bad = p.find_parent(["aside", "figcaption", "nav", "footer"])
         if bad:
             continue
@@ -202,13 +192,12 @@ def crawl_today(category_url=CATEGORY_URL, today_kst=None, limit=40, sleep_sec=1
         today_kst = datetime.now(KST)
     links = get_article_links(category_url, limit=limit)
     results = []
-    for i, url in enumerate(links, 1):
+    for url in links:
         try:
             art = parse_article(url)
             if art["published_kst"] and is_today_kst(datetime.fromisoformat(art["published_kst"]), today_kst):
                 results.append(art)
         except Exception:
-            # 개별 기사 실패는 계속 진행
             pass
         time.sleep(sleep_sec)  # 예의상 천천히
     return results
@@ -226,13 +215,12 @@ if __name__ == "__main__":
 # --- Azure Functions HTTP 트리거 추가 ---
 try:
     import azure.functions as func
-
     app = func.FunctionApp()
 
-    @app.route(route="aitoday", methods=["GET", "POST"], auth_level=func.AuthLevel.ANONYMOUS)
+    # ✅ 라우트 이름을 'ai-today' 로 통일 (호출은 /api/ai-today)
+    @app.route(route="ai-today", methods=["GET", "POST"], auth_level=func.AuthLevel.ANONYMOUS)
     def ai_today(req: func.HttpRequest) -> func.HttpResponse:
         try:
-            # 파라미터 수집
             qs = req.params
             date_str = qs.get("date")
             limit_str = qs.get("limit")
@@ -283,7 +271,6 @@ try:
                 except Exception:
                     pass
 
-            # 크롤링 실행
             items = crawl_today(
                 category_url=category_url,
                 today_kst=today_kst,
@@ -296,17 +283,19 @@ try:
                 "count": len(items),
                 "items": items,
             }
-            return func.HttpResponse(
-                json.dumps(out, ensure_ascii=False),
-                status_code=200,
-                mimetype="application/json",
-            )
+            return func.HttpResponse(json.dumps(out, ensure_ascii=False), status_code=200, mimetype="application/json")
+
         except Exception as e:
             return func.HttpResponse(
                 json.dumps({"error": "internal_error", "detail": str(e)}),
                 status_code=500,
                 mimetype="application/json",
             )
+
+    # (선택) 라우팅만 빠르게 확인하는 핑 엔드포인트
+    @app.route(route="ping", methods=["GET"], auth_level=func.AuthLevel.ANONYMOUS)
+    def ping(req: func.HttpRequest) -> func.HttpResponse:
+        return func.HttpResponse("ok", status_code=200)
 
 except ImportError:
     # 로컬에서 azure.functions 미설치 시에도 __main__ 동작하도록 무시
