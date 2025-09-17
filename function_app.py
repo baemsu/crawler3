@@ -267,7 +267,7 @@ try:
         return func.HttpResponse(json.dumps(status), status_code=200, mimetype="application/json")
 
     # 메인 크롤링 엔드포인트
-    @app.route(route="ai-today", methods=["GET", "POST"], auth_level=func.AuthLevel.ANONYMOUS)
+    @app.route(route="aitoday", methods=["GET", "POST"], auth_level=func.AuthLevel.ANONYMOUS)
     def ai_today(req: func.HttpRequest) -> func.HttpResponse:
         try:
             # 의존성 검증 (미설치면 500으로 원인 반환)
