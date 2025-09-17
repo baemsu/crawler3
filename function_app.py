@@ -229,7 +229,7 @@ try:
 
     app = func.FunctionApp()
 
-    @app.route(route="ai-today", methods=["GET", "POST"], auth_level=func.AuthLevel.ANONYMOUS)
+    @app.route(route="aitoday", methods=["GET", "POST"], auth_level=func.AuthLevel.ANONYMOUS)
     def ai_today(req: func.HttpRequest) -> func.HttpResponse:
         try:
             # 파라미터 수집
