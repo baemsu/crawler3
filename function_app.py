@@ -1,32 +1,71 @@
 # 필요한 패키지:
 # pip install requests beautifulsoup4 tzdata azure-functions
 
-import requests
-from bs4 import BeautifulSoup
-from urllib.parse import urljoin, urlparse
-from datetime import datetime, timezone, timedelta
 import json
 import re
 import time
+from urllib.parse import urljoin, urlparse
+from datetime import datetime, timezone, timedelta
 
-# --- KST 설정 (zoneinfo 실패 환경 대비 폴백) ---
+# -----------------------------
+# 1) 안전한 임포트(실패해도 앱은 로드)
+# -----------------------------
+REQUESTS_OK = True
+BS4_OK = True
+ZONEINFO_OK = True
+IMPORT_ERRORS = {}
+
+try:
+    import requests
+except Exception as e:
+    REQUESTS_OK = False
+    IMPORT_ERRORS["requests"] = str(e)
+
+try:
+    from bs4 import BeautifulSoup  # beautifulsoup4
+except Exception as e:
+    BS4_OK = False
+    IMPORT_ERRORS["beautifulsoup4"] = str(e)
+
+# KST 설정 (zoneinfo 실패 환경 대비 폴백)
 try:
     from zoneinfo import ZoneInfo  # Python 3.9+
     try:
         KST = ZoneInfo("Asia/Seoul")
-    except Exception:
+    except Exception as e:
+        ZONEINFO_OK = False
+        IMPORT_ERRORS["zoneinfo"] = f'Asia/Seoul load failed: {e}'
         KST = timezone(timedelta(hours=9))  # 폴백: UTC+9
-except Exception:
+except Exception as e:
+    ZONEINFO_OK = False
+    IMPORT_ERRORS["zoneinfo"] = f'import failed: {e}'
     KST = timezone(timedelta(hours=9))
 
 CATEGORY_URL = "https://techcrunch.com/category/artificial-intelligence/"
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                  "AppleWebKit/537.36 (KHTML, like Gecko) "
-                  "Chrome/120.0.0.0 Safari/537.36"
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/120.0.0.0 Safari/537.36"
+    )
 }
 
+# -----------------------------
+# 2) 크롤링 유틸 (의존성 체크 포함)
+# -----------------------------
+def _require_deps():
+    """필수 의존성이 없으면 예외를 올려 함수는 살아있되 응답으로 원인 전달."""
+    missing = []
+    if not REQUESTS_OK:
+        missing.append("requests")
+    if not BS4_OK:
+        missing.append("beautifulsoup4")
+    if missing:
+        detail = {k: IMPORT_ERRORS.get(k, "missing") for k in missing}
+        raise RuntimeError(f"Missing deps: {', '.join(missing)}", detail)
+
 def fetch(url):
+    _require_deps()
     r = requests.get(url, headers=HEADERS, timeout=20)
     r.raise_for_status()
     return r
@@ -35,6 +74,7 @@ def get_article_links(category_url=CATEGORY_URL, limit=50):
     """
     카테고리 페이지에서 기사 링크를 최대 limit개까지 수집.
     """
+    _require_deps()
     html = fetch(category_url).text
     soup = BeautifulSoup(html, "html.parser")
     links = set()
@@ -73,15 +113,8 @@ def normalize_link(href: str) -> str:
 def parse_article(url: str):
     """
     기사 페이지에서 제목, 본문, 발행일시(UTC/KST 변환)를 파싱.
-    발행일 우선순위:
-      1) <meta property="article:published_time" content="ISO8601">
-      2) JSON-LD(NewsArticle/BlogPosting) 내 datePublished
-      3) <time datetime="...">
-      4) 페이지 텍스트의 월/일/연도 패턴
-    본문 우선순위:
-      1) JSON-LD의 articleBody
-      2) <article> 내 <p>들 연결
     """
+    _require_deps()
     res = fetch(url)
     soup = BeautifulSoup(res.text, "html.parser")
 
@@ -188,6 +221,7 @@ def is_today_kst(dt: datetime, today_kst: datetime):
     return dt.astimezone(KST).date() == today_kst.date()
 
 def crawl_today(category_url=CATEGORY_URL, today_kst=None, limit=40, sleep_sec=1.0):
+    _require_deps()
     if today_kst is None:
         today_kst = datetime.now(KST)
     links = get_article_links(category_url, limit=limit)
@@ -204,23 +238,41 @@ def crawl_today(category_url=CATEGORY_URL, today_kst=None, limit=40, sleep_sec=1
 
 # --- 로컬 실행용 진입점(유지) ---
 if __name__ == "__main__":
-    today_kst = datetime.now(KST)
-    items = crawl_today(today_kst=today_kst, limit=50, sleep_sec=0.7)
-    print(json.dumps({
-        "date_kst": today_kst.strftime("%Y-%m-%d"),
-        "count": len(items),
-        "items": items
-    }, ensure_ascii=False, indent=2))
+    try:
+        items = crawl_today(today_kst=datetime.now(KST), limit=50, sleep_sec=0.7)
+        print(json.dumps({
+            "date_kst": datetime.now(KST).strftime("%Y-%m-%d"),
+            "count": len(items),
+            "items": items
+        }, ensure_ascii=False, indent=2))
+    except Exception as e:
+        print("LOCAL ERROR:", e)
 
-# --- Azure Functions HTTP 트리거 추가 ---
+# -----------------------------
+# 3) Azure Functions 엔드포인트
+# -----------------------------
 try:
     import azure.functions as func
     app = func.FunctionApp()
 
-    # ✅ 라우트 이름을 'ai-today' 로 통일 (호출은 /api/ai-today)
+    # 라우팅/도메인만 빠르게 확인하는 핑
+    @app.route(route="ping", methods=["GET"], auth_level=func.AuthLevel.ANONYMOUS)
+    def ping(req: func.HttpRequest) -> func.HttpResponse:
+        status = {
+            "requests": REQUESTS_OK,
+            "beautifulsoup4": BS4_OK,
+            "zoneinfo": ZONEINFO_OK,
+            "import_errors": IMPORT_ERRORS,
+        }
+        return func.HttpResponse(json.dumps(status), status_code=200, mimetype="application/json")
+
+    # 메인 크롤링 엔드포인트
     @app.route(route="ai-today", methods=["GET", "POST"], auth_level=func.AuthLevel.ANONYMOUS)
     def ai_today(req: func.HttpRequest) -> func.HttpResponse:
         try:
+            # 의존성 검증 (미설치면 500으로 원인 반환)
+            _require_deps()
+
             qs = req.params
             date_str = qs.get("date")
             limit_str = qs.get("limit")
@@ -286,16 +338,17 @@ try:
             return func.HttpResponse(json.dumps(out, ensure_ascii=False), status_code=200, mimetype="application/json")
 
         except Exception as e:
-            return func.HttpResponse(
-                json.dumps({"error": "internal_error", "detail": str(e)}),
-                status_code=500,
-                mimetype="application/json",
-            )
-
-    # (선택) 라우팅만 빠르게 확인하는 핑 엔드포인트
-    @app.route(route="ping", methods=["GET"], auth_level=func.AuthLevel.ANONYMOUS)
-    def ping(req: func.HttpRequest) -> func.HttpResponse:
-        return func.HttpResponse("ok", status_code=200)
+            # 의존성/네트워크 등 모든 실패를 JSON으로 리턴
+            detail = getattr(e, "args", [str(e)])
+            payload = {"error": "internal_error", "detail": detail}
+            # 의존성 문제라면 설치상태도 같이 반환
+            if not REQUESTS_OK or not BS4_OK:
+                payload["deps"] = {
+                    "requests": REQUESTS_OK,
+                    "beautifulsoup4": BS4_OK,
+                    "import_errors": IMPORT_ERRORS
+                }
+            return func.HttpResponse(json.dumps(payload, ensure_ascii=False), status_code=500, mimetype="application/json")
 
 except ImportError:
     # 로컬에서 azure.functions 미설치 시에도 __main__ 동작하도록 무시
