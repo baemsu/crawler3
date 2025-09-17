@@ -219,6 +219,7 @@ if __name__ == "__main__":
     }, ensure_ascii=False, indent=2))
 
 
+# --- Azure Functions HTTP 트리거 추가 ---
 try:
     import azure.functions as func
 
@@ -226,13 +227,13 @@ try:
 
     @app.route(route="ai-today", methods=["GET", "POST"], auth_level=func.AuthLevel.FUNCTION)
     def ai_today(req: func.HttpRequest) -> func.HttpResponse:
+        from datetime import datetime
         try:
-            # 쿼리/바디 파라미터 수집
+            # 파라미터 수집
             qs = req.params
             date_str = qs.get("date")
             limit_str = qs.get("limit")
             sleep_str = qs.get("sleep")
-            category_url = qs.get("category_url") or CATEGORY_URL
 
             if req.method == "POST":
                 try:
@@ -240,69 +241,34 @@ try:
                 except ValueError:
                     body = {}
                 date_str = body.get("date", date_str)
-                if "limit" in body and body.get("limit") is not None:
-                    limit_str = str(body.get("limit"))
-                if "sleep" in body and body.get("sleep") is not None:
-                    sleep_str = str(body.get("sleep"))
-                category_url = body.get("category_url", category_url)
+                limit_str = str(body.get("limit")) if "limit" in body else limit_str
+                sleep_str = str(body.get("sleep")) if "sleep" in body else sleep_str
 
-            # date 파싱(KST 기준 일자 고정)
-            today_kst = None
-            if date_str:
-                try:
-                    yyyy, mm, dd = map(int, date_str.split("-"))
-                    today_kst = datetime(yyyy, mm, dd, tzinfo=KST)
-                except Exception:
-                    return func.HttpResponse(
-                        json.dumps({"error": "invalid date format, use YYYY-MM-DD"}),
-                        status_code=400,
-                        mimetype="application/json",
-                    )
+            # 기본값 처리
+            from datetime import timezone
+            today_kst = datetime.now(KST) if not date_str else datetime(*map(int, date_str.split("-")), tzinfo=KST)
+            limit = int(limit_str) if limit_str else 40
+            sleep_sec = float(sleep_str) if sleep_str else 0.7
 
-            # limit/sleep 기본값 및 범위
-            limit = 40
-            if limit_str:
-                try:
-                    limit = max(1, min(int(limit_str), 80))
-                except Exception:
-                    pass
-
-            sleep_sec = 0.7
-            if sleep_str:
-                try:
-                    sleep_sec = float(sleep_str)
-                    if sleep_sec < 0:
-                        sleep_sec = 0.0
-                    if sleep_sec > 2:
-                        sleep_sec = 2.0
-                except Exception:
-                    pass
-
-            # 크롤링 실행
-            items = crawl_today(
-                category_url=category_url,
-                today_kst=today_kst,
-                limit=limit,
-                sleep_sec=sleep_sec,
-            )
-
+            items = crawl_today(today_kst=today_kst, limit=limit, sleep_sec=sleep_sec)
             out = {
-                "date_kst": (today_kst or datetime.now(KST)).strftime("%Y-%m-%d"),
+                "date_kst": today_kst.strftime("%Y-%m-%d"),
                 "count": len(items),
-                "items": items,
+                "items": items
             }
+
             return func.HttpResponse(
                 json.dumps(out, ensure_ascii=False),
                 status_code=200,
-                mimetype="application/json",
+                mimetype="application/json"
             )
         except Exception as e:
             return func.HttpResponse(
-                json.dumps({"error": "internal_error", "detail": str(e)}),
+                json.dumps({"error": str(e)}),
                 status_code=500,
-                mimetype="application/json",
+                mimetype="application/json"
             )
 
 except ImportError:
-    # 로컬에서 azure.functions 미설치 시에도 기존 __main__ 실행이 가능하도록
+    # 로컬 실행시 azure.functions 미설치 무시
     pass
