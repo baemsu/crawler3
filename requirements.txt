@@ -1,0 +1,5 @@
+azure-functions
+requests
+beautifulsoup4
+# (선택) 일부 환경에서 ZoneInfo용 타임존 DB 보완:
+tzdata>=2024.1
